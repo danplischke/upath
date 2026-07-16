@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- upath: native async support via `upath.AsyncUPath`, backed by fsspec's async
+  filesystems with a transparent thread-offload fallback for sync-only backends
+
 ## [0.3.10] - 2026-02-22
 
 ### Fixed

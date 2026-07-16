@@ -50,6 +50,7 @@ nav:
     - Universal Pathlib: concepts/upath.md
   - Usage:
     - Basic Usage: usage.md
+    - Async Support: async.md
   - API Reference:
     - Core: api/index.md
     - Registry: api/registry.md

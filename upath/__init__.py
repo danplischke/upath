@@ -10,10 +10,11 @@ except ImportError:
     __version__ = "not-installed"
 
 if TYPE_CHECKING:
+    from upath._async import AsyncUPath
     from upath.core import UnsupportedOperation
     from upath.core import UPath
 
-__all__ = ["UPath", "UnsupportedOperation"]
+__all__ = ["UPath", "AsyncUPath", "UnsupportedOperation"]
 
 
 def __getattr__(name):
@@ -22,6 +23,11 @@ def __getattr__(name):
 
         globals()["UPath"] = UPath
         return UPath
+    elif name == "AsyncUPath":
+        from upath._async import AsyncUPath
+
+        globals()["AsyncUPath"] = AsyncUPath
+        return AsyncUPath
     elif name == "UnsupportedOperation":
         from upath.core import UnsupportedOperation
 
