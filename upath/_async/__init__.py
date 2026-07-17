@@ -11,9 +11,9 @@ Filesystem operations are dispatched to the underlying fsspec filesystem's
 native async implementation when it provides one (``fs.async_impl is True``,
 e.g. ``s3``, ``gcs``, ``http``, ``abfs``). For filesystems that only implement
 a synchronous interface (e.g. ``memory``, ``file``, ``sftp``, ``ftp``,
-``webdav``) the operations are transparently offloaded to a thread via
-:func:`asyncio.to_thread` -- either through fsspec's ``AsyncFileSystemWrapper``
-when available, or a small built-in fallback for older fsspec versions.
+``webdav``) the operations are transparently offloaded to a thread pool (see
+:mod:`upath._async._offload`); connection-based backends serialize onto a single
+per-connection worker thread.
 """
 
 from __future__ import annotations

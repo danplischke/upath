@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - upath: native async support via `upath.AsyncUPath`, backed by fsspec's async
   filesystems with a transparent thread-offload fallback for sync-only backends
+- upath._async: async `copy`/`copy_into`/`move`/`move_into` (incl. cross-filesystem
+  recursive copy) and `samefile`; `rename` invalidates listing caches so
+  subsequent async reads observe the move on filesystems that don't self-invalidate
+  (e.g. ftp)
+- tests: async parity suite (`upath/tests/async_cases.py`) mirroring the shared
+  synchronous test tiers, with per-backend `test_async_*.py` across all backends
+- upath._async: centralized thread-offload (`upath/_async/_offload.py`) on a
+  dedicated bounded pool (`UPATH_ASYNC_MAX_THREADS`); connection-based backends
+  (ftp/sftp/ssh/smb) serialize onto a single per-connection worker thread;
+  `run_in_thread` is an override seam for alternate runtimes
 
 ## [0.3.10] - 2026-02-22
 

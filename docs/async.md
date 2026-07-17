@@ -54,20 +54,41 @@ results = await asyncio.gather(*(p.read_bytes() for p in paths))
 
 For backends that only implement a **synchronous** interface (e.g. `memory`,
 `file`, `sftp`, `ftp`, `webdav`, `smb`), the operations are transparently
-offloaded to a thread via [`asyncio.to_thread`][asyncio.to_thread] — using
-fsspec's `AsyncFileSystemWrapper` when available, or a small built-in fallback
-for older fsspec versions. The API is identical either way; only the degree of
-real concurrency differs.
+offloaded to a thread. The API is identical either way; only the degree of real
+concurrency differs.
 
 The async filesystem instance is available on `AsyncUPath` via the
 `_async_fs` attribute, and the synchronous fsspec filesystem remains available
 via `.fs` for fsspec-specific functionality.
 
+## Runtime and thread-offload
+
+`AsyncUPath` targets **asyncio**. This matches fsspec: its native async
+filesystems (s3fs/aiobotocore, gcsfs/http/aiohttp) are asyncio-only, so cloud
+backends cannot run under trio regardless of upath.
+
+Thread offloads for sync-only backends are centralized in `upath._async._offload`:
+
+- **Bounded pool.** Blocking calls run on a dedicated `ThreadPoolExecutor` rather
+  than the event loop's shared default executor. Size it with the
+  `UPATH_ASYNC_MAX_THREADS` environment variable (default `min(32, cpu+4)`).
+- **Connection safety.** Connection-based backends (`ftp`, `sftp`, `ssh`, `smb`)
+  hold a single, non-thread-safe connection per filesystem instance, so *all* of
+  their offloaded work — metadata calls and file-handle reads/writes alike — is
+  serialized onto one dedicated worker thread per connection. Stateless backends
+  share the bounded pool.
+- **Override point.** `upath._async._offload.run_in_thread` is the single offload
+  primitive. Reassign it (e.g. to `anyio.to_thread.run_sync`) to route offloads
+  through another runtime's thread helper without touching any call site — note
+  that only the sync-backend paths become runtime-portable; native cloud backends
+  remain asyncio-bound.
+
 ## Supported operations
 
 Coroutines: `read_bytes`, `read_text`, `write_bytes`, `write_text`, `open`,
-`stat`, `lstat`, `exists`, `is_dir`, `is_file`, `mkdir`, `rmdir`, `unlink`,
-`touch`, `rename`, `replace`.
+`stat`, `lstat`, `samefile`, `exists`, `is_dir`, `is_file`, `mkdir`, `rmdir`,
+`unlink`, `touch`, `rename`, `replace`, `copy`, `copy_into`, `move`,
+`move_into`.
 
 Async iterators: `iterdir`, `glob`, `rglob`, `walk`.
 

@@ -18,22 +18,23 @@ Instances are created through the :class:`AsyncUPath` factory exactly like
 
 from __future__ import annotations
 
-import asyncio
 import warnings
+from pathlib import PurePath
 from typing import TYPE_CHECKING
 from typing import Any
-
-from fsspec import get_filesystem_class
 
 from upath._async._fs import _AsyncFileWrapper
 from upath._async._fs import has_working_open_async
 from upath._async._fs import resolve_async_fs
 from upath._async._info import AsyncUPathInfo
+from upath._async._offload import executor_for
+from upath._async._offload import run_in_thread
 from upath._protocol import get_upath_protocol
 from upath._stat import UPathStatResult
 from upath.core import UPath
 from upath.registry import _get_implementation_protocols
 from upath.registry import get_upath_class
+from upath.types import UNSET_DEFAULT
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -46,15 +47,12 @@ if TYPE_CHECKING:
 __all__ = ["AsyncUPath", "get_async_upath_class"]
 
 
-_UNSET = object()
-
-
 # --- async subclass synthesis / dispatch ----------------------------------
 
-_async_class_cache: dict[type[UPath], type["AsyncUPath"]] = {}
+_async_class_cache: dict[type[UPath], type[AsyncUPath]] = {}
 
 
-def _async_class_for(sync_cls: type[UPath]) -> type["AsyncUPath"]:
+def _async_class_for(sync_cls: type[UPath]) -> type[AsyncUPath]:
     """Return (and cache) the async subclass mixing async I/O over ``sync_cls``."""
     try:
         return _async_class_cache[sync_cls]
@@ -75,18 +73,94 @@ def _async_class_for(sync_cls: type[UPath]) -> type["AsyncUPath"]:
             "__slots__": ("_async_fs_cached",),
             "_sync_class": sync_cls,
             "__module__": __name__,
+            "__qualname__": name,
         },
     )
     AsyncUPath.register(async_cls)  # type: ignore[arg-type]
+    # Preserve backend-specific I/O customizations: where the sync class
+    # overrides one of these methods with custom logic -- e.g. DataPath.glob
+    # returning [], S3Path.mkdir's exist_ok semantics, or the read-only backends
+    # (http/data/github/hf/zip/tar) whose writes raise UnsupportedOperation --
+    # the generic async implementation from _AsyncPathMixin would lose that
+    # behavior. For those methods we offload the sync override to a thread so it
+    # reproduces the exact semantics. Backends that don't customize a method keep
+    # the generic (natively-async where possible) implementation.
+    _attach_offloaded_overrides(async_cls, sync_cls)
+    # Expose the generated class as a module global so it is picklable by
+    # qualified name (``upath._async.core.Async<Name>``).
+    globals()[name] = async_cls
     _async_class_cache[sync_cls] = async_cls  # type: ignore[assignment]
     return async_cls  # type: ignore[return-value]
+
+
+# methods whose sync customization must be preserved (offloaded to a thread)
+_OFFLOAD_SCALAR = (
+    "stat",
+    "exists",
+    "is_dir",
+    "is_file",
+    "mkdir",
+    "touch",
+    "unlink",
+    "write_bytes",
+    "write_text",
+)
+_OFFLOAD_GENERATOR = ("iterdir", "glob", "rglob", "walk")
+
+
+def _attach_offloaded_overrides(async_cls: type, sync_cls: type[UPath]) -> None:
+    def _customizes(method: str) -> bool:
+        # stdlib-pathlib-backed local classes (PosixUPath/WindowsUPath) work
+        # fine through the generic async layer, so never offload for them.
+        if issubclass(sync_cls, PurePath):
+            return False
+        return getattr(sync_cls, method, None) is not getattr(UPath, method, None)
+
+    for method in _OFFLOAD_SCALAR:
+        if _customizes(method):
+            setattr(async_cls, method, _make_offloaded_scalar(method))
+    for method in _OFFLOAD_GENERATOR:
+        if _customizes(method):
+            setattr(async_cls, method, _make_offloaded_generator(method))
+
+
+def _make_offloaded_scalar(method: str) -> Any:
+    async def _offloaded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        sync_self = self._sync_view()
+        return await run_in_thread(
+            getattr(sync_self, method),
+            *args,
+            executor=executor_for(self.fs),
+            **kwargs,
+        )
+
+    _offloaded.__name__ = method
+    return _offloaded
+
+
+def _make_offloaded_generator(method: str) -> Any:
+    async def _offloaded(self: Any, *args: Any, **kwargs: Any) -> Any:
+        sync_self = self._sync_view()
+        items = await run_in_thread(
+            lambda: list(getattr(sync_self, method)(*args, **kwargs)),
+            executor=executor_for(self.fs),
+        )
+        for item in items:
+            if method == "walk":
+                dirpath, dirnames, filenames = item
+                yield self.with_segments(str(dirpath)), dirnames, filenames
+            else:
+                yield self.with_segments(str(item))
+
+    _offloaded.__name__ = method
+    return _offloaded
 
 
 def get_async_upath_class(
     protocol: str,
     *,
     fallback: bool = True,
-) -> type["AsyncUPath"] | None:
+) -> type[AsyncUPath] | None:
     """Return the :class:`AsyncUPath` subclass for ``protocol``.
 
     Reuses the synchronous registry (:func:`upath.registry.get_upath_class`)
@@ -119,13 +193,32 @@ class _AsyncPathMixin:
     # populated on synthesized subclasses; None on the AsyncUPath base
     _sync_class: type[UPath] | None = None
 
+    def _sync_view(self) -> UPath:
+        """A synchronous UPath equivalent, used to offload customized sync I/O.
+
+        Reconstructs a sync ``UPath`` (preserving storage options) for backends
+        whose I/O methods carry custom logic the generic async layer can't
+        replicate. Only used for those offloaded methods.
+
+        The reconstructed path reuses this path's underlying fsspec filesystem
+        instance (``self.fs``) rather than resolving a fresh one. For non-cachable
+        filesystems (e.g. ftp) this matters: the thread-offload async wrapper
+        wraps ``self.fs``, so any cache invalidation an offloaded sync method
+        performs must land on that same instance to be visible to later async
+        reads.
+        """
+        sync_cls = self._sync_class or UPath
+        sync_path = sync_cls(str(self), **dict(self.storage_options))  # type: ignore[attr-defined]
+        sync_path._fs_cached = self.fs  # type: ignore[attr-defined]
+        return sync_path
+
     def __new__(
         cls,
         *args: JoinablePathLike,
         protocol: str | None = None,
         chain_parser: Any = None,
         **storage_options: Any,
-    ) -> "AsyncUPath":
+    ) -> AsyncUPath:
         # `chain_parser` is consumed by __init__; accept it here so it is not
         # misrouted into storage_options during dispatch.
         if "scheme" in storage_options:
@@ -160,8 +253,9 @@ class _AsyncPathMixin:
         try:
             return self._async_fs_cached
         except AttributeError:
-            fs_cls = get_filesystem_class(self.protocol)  # type: ignore[attr-defined]
-            fs = resolve_async_fs(fs_cls, dict(self.storage_options))  # type: ignore[attr-defined]
+            # resolve from the chain-aware sync instance so chained URLs
+            # (e.g. simplecache::memory://) are handled correctly
+            fs = resolve_async_fs(self.fs)  # type: ignore[attr-defined]
             self._async_fs_cached = fs
             return fs
 
@@ -221,15 +315,17 @@ class _AsyncPathMixin:
             open_kwargs["errors"] = errors
         if newline is not None:
             open_kwargs["newline"] = newline
-        f = await asyncio.to_thread(
+        executor = executor_for(self.fs)  # type: ignore[attr-defined]
+        f = await run_in_thread(
             self.fs.open,  # type: ignore[attr-defined]
             self.path,
             mode,
+            executor=executor,
             **open_kwargs,
         )
-        return _AsyncFileWrapper(f)
+        return _AsyncFileWrapper(f, executor)
 
-    async def iterdir(self) -> AsyncIterator["AsyncUPath"]:
+    async def iterdir(self) -> AsyncIterator[AsyncUPath]:
         """Yield async path objects of the directory contents."""
         sep = self.parser.sep  # type: ignore[attr-defined]
         base = self
@@ -252,7 +348,7 @@ class _AsyncPathMixin:
         *,
         case_sensitive: bool | None = None,
         recurse_symlinks: bool = False,
-    ) -> AsyncIterator["AsyncUPath"]:
+    ) -> AsyncIterator[AsyncUPath]:
         """Yield paths matching the given relative pattern."""
         this = self
         if this._relative_base is not None:  # type: ignore[attr-defined]
@@ -270,7 +366,7 @@ class _AsyncPathMixin:
         *,
         case_sensitive: bool | None = None,
         recurse_symlinks: bool = False,
-    ) -> AsyncIterator["AsyncUPath"]:
+    ) -> AsyncIterator[AsyncUPath]:
         """Recursively yield paths matching the given relative pattern."""
         this = self
         if this._relative_base is not None:  # type: ignore[attr-defined]
@@ -287,7 +383,7 @@ class _AsyncPathMixin:
         top_down: bool = True,
         on_error: Callable[[OSError], None] | None = None,
         follow_symlinks: bool = False,
-    ) -> AsyncIterator[tuple["AsyncUPath", list[str], list[str]]]:
+    ) -> AsyncIterator[tuple[AsyncUPath, list[str], list[str]]]:
         """Walk the directory tree, yielding ``(dirpath, dirnames, filenames)``."""
         fs = self._async_fs
         sep = self.parser.sep  # type: ignore[attr-defined]
@@ -302,6 +398,10 @@ class _AsyncPathMixin:
             except OSError as error:
                 if on_error is not None:
                     on_error(error)
+                continue
+            except NotImplementedError:
+                # backend cannot list this path (e.g. a non-directory "root"
+                # such as data:); like os.walk on a file, yield nothing for it
                 continue
             dirnames: list[str] = []
             filenames: list[str] = []
@@ -326,11 +426,27 @@ class _AsyncPathMixin:
 
     async def stat(self, *, follow_symlinks: bool = True) -> UPathStatResult:
         """Return an ``os.stat_result``-like object for this path."""
+        if not follow_symlinks:
+            warnings.warn(
+                f"{type(self).__name__}.stat(follow_symlinks=False):"
+                " is currently ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
         info = await self._async_fs._info(self.path)  # type: ignore[attr-defined]
         return UPathStatResult.from_info(info)
 
     async def lstat(self) -> UPathStatResult:
         return await self.stat(follow_symlinks=False)
+
+    async def samefile(self, other_path: Any) -> bool:
+        """Whether this path and ``other_path`` point to the same file."""
+        st = await self.stat()
+        if isinstance(other_path, _AsyncPathMixin):
+            other_st = await other_path.stat()
+        else:
+            other_st = await self.with_segments(other_path).stat()  # type: ignore[attr-defined]
+        return st == other_st
 
     async def exists(self, *, follow_symlinks: bool = True) -> bool:
         """Whether this path exists."""
@@ -394,11 +510,12 @@ class _AsyncPathMixin:
         exists = await self.exists()
         if exists and not exist_ok:
             raise FileExistsError(str(self))
+        executor = executor_for(self.fs)  # type: ignore[attr-defined]
         if not exists:
-            await asyncio.to_thread(self.fs.touch, self.path, truncate=True)  # type: ignore[attr-defined]
+            await run_in_thread(self.fs.touch, self.path, truncate=True, executor=executor)  # type: ignore[attr-defined]
         else:
             try:
-                await asyncio.to_thread(self.fs.touch, self.path, truncate=False)  # type: ignore[attr-defined]
+                await run_in_thread(self.fs.touch, self.path, truncate=False, executor=executor)  # type: ignore[attr-defined]
             except (NotImplementedError, ValueError):
                 pass
 
@@ -414,44 +531,156 @@ class _AsyncPathMixin:
         """Remove this directory (recursively by default; non-standard)."""
         if not await self.is_dir():
             raise NotADirectoryError(str(self))
+        if not recursive:
+            async for _ in self.iterdir():
+                raise OSError(f"Not recursive and directory not empty: {self}")
         await self._async_fs._rm(self.path, recursive=recursive)  # type: ignore[attr-defined]
 
     async def rename(
         self,
         target: JoinablePathLike,
+        *,
+        recursive: Any = UNSET_DEFAULT,
+        maxdepth: int | None = UNSET_DEFAULT,
         **kwargs: Any,
-    ) -> "AsyncUPath":
-        """Rename this file or directory to the given target."""
-        target_upath = self._resolve_rename_target(target)
-        if target_upath == self:
-            return target_upath
-        src = self.absolute().path  # type: ignore[attr-defined]
-        dst = target_upath.absolute().path
-        await asyncio.to_thread(self.fs.mv, src, dst, **kwargs)  # type: ignore[attr-defined]
-        return target_upath
+    ) -> AsyncUPath:
+        """Rename this file or directory to the given target.
 
-    async def replace(self, target: JoinablePathLike) -> "AsyncUPath":
-        return await self.rename(target)
-
-    async def write_from(
-        self,
-        source: "AsyncUPath",
-        **kwargs: Any,
-    ) -> None:
-        """Copy ``source`` into this path (same protocol, filesystem-native)."""
-        await self._async_fs._copy(source.path, self.path, **kwargs)  # type: ignore[attr-defined]
-
-    # -- helpers ----------------------------------------------------------
-
-    def _resolve_rename_target(self, target: JoinablePathLike) -> "AsyncUPath":
-        if isinstance(target, _AsyncPathMixin):
-            return target  # type: ignore[return-value]
+        The target-normalization mirrors :meth:`upath.UPath.rename`; only the
+        terminal filesystem move is performed asynchronously.
+        """
+        # check protocol compatibility
         target_protocol = get_upath_protocol(target)
         if target_protocol and target_protocol != self.protocol:  # type: ignore[attr-defined]
             raise ValueError(
                 f"expected protocol {self.protocol!r}, got: {target_protocol!r}"  # type: ignore[attr-defined]
             )
-        return self.with_segments(str(target))  # type: ignore[attr-defined]
+        # ensure target is an absolute AsyncUPath (path algebra is synchronous)
+        if not isinstance(target, type(self)):
+            if isinstance(target, (UPath, PurePath)):
+                target_str = target.as_posix()
+            else:
+                target_str = str(target)
+            if target_protocol:
+                target = self.with_segments(target_str)  # type: ignore[attr-defined]
+            elif self.anchor and target_str.startswith(self.anchor):  # type: ignore[attr-defined]
+                target = self.with_segments(target_str)  # type: ignore[attr-defined]
+            elif not self.anchor and target_str.startswith("./"):  # type: ignore[attr-defined]
+                target = (
+                    self.cwd()  # type: ignore[attr-defined]
+                    .joinpath(target_str.removeprefix("./"))
+                    .relative_to(self.cwd())  # type: ignore[attr-defined]
+                )
+            else:
+                target = self.cwd().joinpath(target_str).relative_to(self.cwd())  # type: ignore[attr-defined]
+        if target == self:
+            return target  # type: ignore[return-value]
+        source_abs = self.absolute()  # type: ignore[attr-defined]
+        target_abs = target.absolute()
+        if ".." in target_abs.parts or "." in target_abs.parts:
+            target_abs = target_abs.resolve()
+        if recursive is not UNSET_DEFAULT:
+            kwargs["recursive"] = recursive
+        if maxdepth is not UNSET_DEFAULT:
+            kwargs["maxdepth"] = maxdepth
+        await run_in_thread(  # type: ignore[attr-defined]
+            self.fs.mv,
+            source_abs.path,
+            target_abs.path,
+            executor=executor_for(self.fs),
+            **kwargs,
+        )
+        # invalidate listing caches so subsequent async reads observe the move
+        # (some filesystems, e.g. ftp, don't self-invalidate on mv). The async
+        # wrapper wraps self.fs, so invalidating it here is what those reads see.
+        self._invalidate_cache(source_abs.parent.path, target_abs.parent.path)
+        return target  # type: ignore[return-value]
+
+    async def replace(self, target: JoinablePathLike) -> AsyncUPath:
+        return await self.rename(target)
+
+    def _invalidate_cache(self, *paths: str) -> None:
+        invalidate = getattr(self.fs, "invalidate_cache", None)  # type: ignore[attr-defined]
+        if invalidate is None:
+            return
+        for path in dict.fromkeys(paths):
+            try:
+                invalidate(path)
+            except Exception:  # pragma: no cover - defensive; cache is best-effort
+                pass
+
+    # -- copy / move ------------------------------------------------------
+
+    async def copy(self, target: Any, **kwargs: Any) -> AsyncUPath:
+        """Recursively copy this file or directory tree to ``target``."""
+        target_upath = self._resolve_target(target)
+        if await target_upath.is_dir():
+            raise IsADirectoryError(str(target_upath))
+        await self._acopy_tree(self, target_upath, **kwargs)
+        return target_upath
+
+    async def copy_into(self, target_dir: Any, **kwargs: Any) -> AsyncUPath:
+        """Copy this file or directory tree into the existing directory."""
+        target_dir_upath = self._resolve_target(target_dir)
+        if not await target_dir_upath.exists():
+            raise FileNotFoundError(str(target_dir_upath))
+        if not await target_dir_upath.is_dir():
+            raise NotADirectoryError(str(target_dir_upath))
+        name = self.name  # type: ignore[attr-defined]
+        if not name:
+            raise ValueError(f"{self!r} has an empty name")
+        return await self.copy(target_dir_upath.joinpath(name), **kwargs)
+
+    async def move(self, target: Any, **kwargs: Any) -> AsyncUPath:
+        """Recursively move this file or directory tree to ``target``."""
+        result = await self.copy(target, **kwargs)
+        await self._async_fs._rm(  # type: ignore[attr-defined]
+            self.path, recursive=await self.is_dir()
+        )
+        return result
+
+    async def move_into(self, target_dir: Any, **kwargs: Any) -> AsyncUPath:
+        """Move this file or directory tree into the existing directory."""
+        name = self.name  # type: ignore[attr-defined]
+        if not name:
+            raise ValueError(f"{self!r} has an empty name")
+        target_dir_upath = self._resolve_target(target_dir)
+        parent = target_dir_upath
+        if not await parent.exists():
+            raise FileNotFoundError(str(parent))
+        if not await parent.is_dir():
+            raise NotADirectoryError(str(parent))
+        return await self.move(target_dir_upath.joinpath(name), **kwargs)
+
+    async def _acopy_tree(
+        self,
+        source: AsyncUPath,
+        dest: AsyncUPath,
+        **kwargs: Any,
+    ) -> None:
+        """Recursively copy ``source`` to ``dest`` (cross-filesystem safe)."""
+        if await source.is_dir():
+            await dest.mkdir(parents=True, exist_ok=True)
+            async for child in source.iterdir():
+                await self._acopy_tree(child, dest.joinpath(child.name), **kwargs)
+        else:
+            data = await source.read_bytes()
+            await dest.write_bytes(data)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _resolve_target(self, target: Any) -> AsyncUPath:
+        """Normalize a copy/move target to an AsyncUPath (path algebra only)."""
+        if isinstance(target, _AsyncPathMixin):
+            return target  # type: ignore[return-value]
+        if isinstance(target, str):
+            proto = get_upath_protocol(target)
+            if proto != self.protocol:  # type: ignore[attr-defined]
+                return AsyncUPath(target)
+            return self.with_segments(target)  # type: ignore[attr-defined]
+        if isinstance(target, (UPath, PurePath)):
+            return AsyncUPath(target.as_posix())
+        return AsyncUPath(target)
 
 
 class AsyncUPath(_AsyncPathMixin, UPath):
