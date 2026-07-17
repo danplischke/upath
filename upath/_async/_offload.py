@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -59,7 +60,23 @@ def _max_workers() -> int:
     return min(32, (os.cpu_count() or 1) + 4)
 
 
+def _op_timeout() -> float | None:
+    """Default per-offload timeout in seconds, from ``UPATH_ASYNC_OP_TIMEOUT``."""
+    raw = os.environ.get("UPATH_ASYNC_OP_TIMEOUT")
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return None
+
+
 _shared_executor: ThreadPoolExecutor | None = None
+# guards lazy creation of the shared pool and of the per-connection executors so
+# concurrent first-use from multiple threads can't leak duplicate pools
+_executor_lock = threading.Lock()
 # per-filesystem single-worker executors, keyed weakly by fs instance so they
 # are cleaned up when the filesystem is garbage collected
 _stateful_executors: weakref.WeakKeyDictionary[Any, ThreadPoolExecutor] = (
@@ -70,10 +87,12 @@ _stateful_executors: weakref.WeakKeyDictionary[Any, ThreadPoolExecutor] = (
 def _get_shared_executor() -> ThreadPoolExecutor:
     global _shared_executor
     if _shared_executor is None:
-        _shared_executor = ThreadPoolExecutor(
-            max_workers=_max_workers(),
-            thread_name_prefix="upath-async",
-        )
+        with _executor_lock:
+            if _shared_executor is None:
+                _shared_executor = ThreadPoolExecutor(
+                    max_workers=_max_workers(),
+                    thread_name_prefix="upath-async",
+                )
     return _shared_executor
 
 
@@ -99,20 +118,21 @@ def executor_for(fs: AbstractFileSystem | None) -> ThreadPoolExecutor:
     so their operations serialize on one thread.
     """
     if fs is not None and _is_stateful(fs):
-        try:
-            executor = _stateful_executors.get(fs)
-        except TypeError:  # fs not weak-referenceable
-            executor = None
-        if executor is None:
-            executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="upath-async-conn",
-            )
+        with _executor_lock:
             try:
-                _stateful_executors[fs] = executor
-            except TypeError:  # pragma: no cover - fs not weak-referenceable
-                pass
-        return executor
+                executor = _stateful_executors.get(fs)
+            except TypeError:  # fs not weak-referenceable
+                executor = None
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="upath-async-conn",
+                )
+                try:
+                    _stateful_executors[fs] = executor
+                except TypeError:  # pragma: no cover - fs not weak-referenceable
+                    pass
+            return executor
     return _get_shared_executor()
 
 
@@ -128,11 +148,28 @@ async def run_in_thread(
     This is the single offload primitive used across the async layer, and the
     supported override point for alternate runtimes. ``executor`` selects the
     pool (see :func:`executor_for`); ``None`` uses the shared stateless pool.
+
+    If the ``UPATH_ASYNC_OP_TIMEOUT`` environment variable is set (seconds),
+    every offloaded call is bounded by it and raises :class:`TimeoutError` on
+    expiry. Note that Python cannot force-kill a worker thread: on timeout -- or
+    if the awaiting task is cancelled -- control returns to the caller, but the
+    blocking call keeps running to completion in the background. For a
+    single-worker (stateful) executor that worker stays busy until it finishes,
+    so prefer a per-connection timeout on the backend where one is available.
+
+    The timeout is read from the environment (not a parameter) so it can never
+    shadow a ``timeout`` keyword that a backend method itself accepts via
+    ``**kwargs`` (e.g. ``fs.mv(..., timeout=...)``).
     """
     loop = asyncio.get_running_loop()
     pool = executor if executor is not None else _get_shared_executor()
     if kwargs:
         from functools import partial
 
-        return await loop.run_in_executor(pool, partial(func, *args, **kwargs))
-    return await loop.run_in_executor(pool, func, *args)
+        future = loop.run_in_executor(pool, partial(func, *args, **kwargs))
+    else:
+        future = loop.run_in_executor(pool, func, *args)
+    timeout = _op_timeout()
+    if timeout is None:
+        return await future
+    return await asyncio.wait_for(future, timeout)

@@ -72,6 +72,12 @@ Thread offloads for sync-only backends are centralized in `upath._async._offload
 - **Bounded pool.** Blocking calls run on a dedicated `ThreadPoolExecutor` rather
   than the event loop's shared default executor. Size it with the
   `UPATH_ASYNC_MAX_THREADS` environment variable (default `min(32, cpu+4)`).
+- **Operation timeout.** Set `UPATH_ASYNC_OP_TIMEOUT` (seconds) to bound each
+  offloaded call; on timeout the awaiting coroutine raises `TimeoutError`. Python
+  cannot force-kill a worker thread, so the blocking call still runs to
+  completion in the background — the timeout returns control to the caller, it
+  does not abort the backend operation. This applies only to thread-offloaded
+  (sync) backends; wrap native cloud calls in `asyncio.timeout()` yourself.
 - **Connection safety.** Connection-based backends (`ftp`, `sftp`, `ssh`, `smb`)
   hold a single, non-thread-safe connection per filesystem instance, so *all* of
   their offloaded work — metadata calls and file-handle reads/writes alike — is
@@ -94,3 +100,27 @@ Async iterators: `iterdir`, `glob`, `rglob`, `walk`.
 
 The `.info` property returns an async info object whose `exists`, `is_dir`,
 `is_file`, and `is_symlink` checks are coroutines.
+
+Arguments that fsspec backends cannot honor — `follow_symlinks=False`,
+`glob`/`rglob`'s `case_sensitive` and `recurse_symlinks`, `open`'s `buffering`,
+and the `mode` of `mkdir`/`touch` — are accepted for `pathlib` signature
+compatibility but emit a `UserWarning` when set to a non-default value instead
+of silently doing nothing.
+
+## Resource cleanup
+
+Each `AsyncUPath` lazily resolves and caches its async filesystem. Native async
+backends are created with `skip_instance_cache=True`, so the path holds the only
+strong reference to the underlying client/session. In long-running programs,
+call `await path.aclose()` — or use the path as an async context manager — to
+drop that reference once you are done, letting the client/session be collected
+instead of living for the lifetime of the path object:
+
+```python
+async with AsyncUPath("s3://my-bucket/key", anon=True) as p:
+    data = await p.read_bytes()
+# the resolved async filesystem is released here
+```
+
+`aclose()` is safe to call repeatedly; the next I/O call transparently
+re-resolves the filesystem.

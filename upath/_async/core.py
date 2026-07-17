@@ -173,6 +173,27 @@ def get_async_upath_class(
     return _async_class_for(sync_cls)
 
 
+# reused across the follow_symlinks warnings on stat/exists/is_dir/is_file
+_IGNORED_FOLLOW_SYMLINKS = "follow_symlinks=False"
+
+
+def _warn_ignored(self: Any, method: str, detail: str) -> None:
+    """Warn that a pathlib-compat argument is accepted but has no effect.
+
+    Several methods accept arguments for signature compatibility with
+    :mod:`pathlib` (``follow_symlinks``, ``case_sensitive``, ``recurse_symlinks``,
+    ``buffering``, ``mode``) that fsspec backends cannot honor. Rather than
+    silently ignoring a non-default value we warn, so callers relying on the
+    behavior find out instead of receiving a wrong result. The message mirrors
+    the synchronous :class:`~upath.UPath` wording.
+    """
+    warnings.warn(
+        f"{type(self).__name__}.{method}(): {detail} is currently ignored.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 # --- async I/O mixin -------------------------------------------------------
 
 
@@ -259,6 +280,30 @@ class _AsyncPathMixin:
             self._async_fs_cached = fs
             return fs
 
+    async def aclose(self) -> None:
+        """Release the async filesystem cached on this path.
+
+        Long-running programs can call this (or use ``async with``) to drop the
+        resolved async filesystem once a path is done with. Native async backends
+        are created with ``skip_instance_cache=True`` (see
+        :func:`~upath._async._fs.resolve_async_fs`), so this path holds the only
+        strong reference to them; dropping it lets the underlying client/session
+        be collected instead of living for the lifetime of the path object. Safe
+        to call more than once -- the next I/O call transparently re-resolves the
+        filesystem.
+        """
+        try:
+            del self._async_fs_cached
+        except AttributeError:
+            # never resolved, or already closed -- nothing to release
+            pass
+
+    async def __aenter__(self) -> AsyncUPath:
+        return self  # type: ignore[return-value]
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
     @property
     def info(self) -> AsyncUPathInfo:  # type: ignore[override]
         """Async filesystem info for this path (status checks are coroutines)."""
@@ -302,6 +347,8 @@ class _AsyncPathMixin:
             async with await path.open("rb") as f:
                 data = await f.read()
         """
+        if buffering != -1:
+            _warn_ignored(self, "open", "buffering")
         fs = self._async_fs
         if "b" in mode and has_working_open_async(fs):
             try:
@@ -350,6 +397,10 @@ class _AsyncPathMixin:
         recurse_symlinks: bool = False,
     ) -> AsyncIterator[AsyncUPath]:
         """Yield paths matching the given relative pattern."""
+        if case_sensitive is not None:
+            _warn_ignored(self, "glob", "case_sensitive")
+        if recurse_symlinks:
+            _warn_ignored(self, "glob", "recurse_symlinks=True")
         this = self
         if this._relative_base is not None:  # type: ignore[attr-defined]
             this = this.absolute()  # type: ignore[attr-defined]
@@ -368,6 +419,10 @@ class _AsyncPathMixin:
         recurse_symlinks: bool = False,
     ) -> AsyncIterator[AsyncUPath]:
         """Recursively yield paths matching the given relative pattern."""
+        if case_sensitive is not None:
+            _warn_ignored(self, "rglob", "case_sensitive")
+        if recurse_symlinks:
+            _warn_ignored(self, "rglob", "recurse_symlinks=True")
         this = self
         if this._relative_base is not None:  # type: ignore[attr-defined]
             this = this.absolute()  # type: ignore[attr-defined]
@@ -385,6 +440,8 @@ class _AsyncPathMixin:
         follow_symlinks: bool = False,
     ) -> AsyncIterator[tuple[AsyncUPath, list[str], list[str]]]:
         """Walk the directory tree, yielding ``(dirpath, dirnames, filenames)``."""
+        if follow_symlinks:
+            _warn_ignored(self, "walk", "follow_symlinks=True")
         fs = self._async_fs
         sep = self.parser.sep  # type: ignore[attr-defined]
         stack: list[Any] = [self]
@@ -427,12 +484,7 @@ class _AsyncPathMixin:
     async def stat(self, *, follow_symlinks: bool = True) -> UPathStatResult:
         """Return an ``os.stat_result``-like object for this path."""
         if not follow_symlinks:
-            warnings.warn(
-                f"{type(self).__name__}.stat(follow_symlinks=False):"
-                " is currently ignored.",
-                UserWarning,
-                stacklevel=2,
-            )
+            _warn_ignored(self, "stat", _IGNORED_FOLLOW_SYMLINKS)
         info = await self._async_fs._info(self.path)  # type: ignore[attr-defined]
         return UPathStatResult.from_info(info)
 
@@ -450,14 +502,20 @@ class _AsyncPathMixin:
 
     async def exists(self, *, follow_symlinks: bool = True) -> bool:
         """Whether this path exists."""
+        if not follow_symlinks:
+            _warn_ignored(self, "exists", _IGNORED_FOLLOW_SYMLINKS)
         return await self._async_fs._exists(self.path)  # type: ignore[attr-defined]
 
     async def is_dir(self, *, follow_symlinks: bool = True) -> bool:
         """Whether this path is a directory."""
+        if not follow_symlinks:
+            _warn_ignored(self, "is_dir", _IGNORED_FOLLOW_SYMLINKS)
         return await self._async_fs._isdir(self.path)  # type: ignore[attr-defined]
 
     async def is_file(self, *, follow_symlinks: bool = True) -> bool:
         """Whether this path is a regular file."""
+        if not follow_symlinks:
+            _warn_ignored(self, "is_file", _IGNORED_FOLLOW_SYMLINKS)
         return await self._async_fs._isfile(self.path)  # type: ignore[attr-defined]
 
     # -- writing / mutation ----------------------------------------------
@@ -491,6 +549,8 @@ class _AsyncPathMixin:
         exist_ok: bool = False,
     ) -> None:
         """Create a new directory at this path."""
+        if mode != 0o777:
+            _warn_ignored(self, "mkdir", "mode")
         fs = self._async_fs
         if parents and not exist_ok and await self.exists():
             raise FileExistsError(str(self))
@@ -507,6 +567,8 @@ class _AsyncPathMixin:
 
     async def touch(self, mode: int = 0o666, exist_ok: bool = True) -> None:
         """Create this file (or update mtime) if it doesn't exist."""
+        if mode != 0o666:
+            _warn_ignored(self, "touch", "mode")
         exists = await self.exists()
         if exists and not exist_ok:
             raise FileExistsError(str(self))
