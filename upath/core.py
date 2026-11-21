@@ -42,6 +42,7 @@ from upath._stat import UPathStatResult
 from upath.registry import _get_implementation_protocols
 from upath.registry import available_implementations
 from upath.registry import get_upath_class
+from upath.tuning import _open_options
 from upath.types import UNSET_DEFAULT
 from upath.types import JoinablePathLike
 from upath.types import OnNameCollisionFunc
@@ -1508,7 +1509,7 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         errors: str | None = UNSET_DEFAULT,
         newline: str | None = UNSET_DEFAULT,
         *,
-        access: AccessHint | None = None,
+        access: AccessHint | None = UNSET_DEFAULT,
         **fsspec_kwargs: Any,
     ) -> IO[Any]:
         """
@@ -1531,10 +1532,13 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
             Experimental. How the reader will access the file, used to pick
             fsspec's ``cache_type`` and ``block_size`` for remote reads:
             ``"scattered"`` (e.g. HDF5/h5ad via h5py), ``"planned"`` (e.g.
-            parquet via pyarrow), ``"whole"``, or ``"auto"`` to guess from
-            the suffix. Explicitly passed ``cache_type``, ``block_size`` or
-            ``buffering`` take precedence. Ignored for write modes. See
-            :mod:`upath.tuning`. Default is None (filesystem defaults).
+            parquet via pyarrow), ``"whole"``, ``"auto"`` to detect from the
+            suffix, or ``None`` to use the filesystem defaults. If not given,
+            ``upath.tuning.get_default_access()`` (``"auto"`` unless changed)
+            applies on filesystems whose files use fsspec's caches (s3, gcs,
+            azure, hf, http), unless the storage options configure caching.
+            Explicitly passed ``cache_type``, ``block_size`` or ``buffering``
+            take precedence. Ignored for write modes. See :mod:`upath.tuning`.
         **fsspec_kwargs:
             Additional options for the fsspec filesystem.
         """
@@ -1551,10 +1555,8 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
             fsspec_kwargs["errors"] = errors
         if newline is not UNSET_DEFAULT:
             fsspec_kwargs["newline"] = newline
-        if access is not None and not set(mode) & set("wax+"):
-            from upath.tuning import fetch_options
-
-            for key, value in fetch_options(access, path=self).items():
+        if not set(mode) & set("wax+"):
+            for key, value in _open_options(self, access).items():
                 fsspec_kwargs.setdefault(key, value)
         return self.fs.open(self.path, mode=mode, **fsspec_kwargs)
 

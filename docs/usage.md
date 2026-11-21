@@ -269,15 +269,19 @@ with fs.open(path_str, 'rb') as f:
 
 fsspec's default cache settings fit sequential reads. Formats such as HDF5/h5ad
 or parquet read only parts of a file, and the defaults can download many times
-the bytes actually needed. Tell `open()` how the file will be read
-(experimental, see [Fetch tuning](api/tuning.md)):
+the bytes actually needed. On cloud and HTTP paths, `open()` therefore picks
+cache settings from the file suffix (experimental, see
+[Fetch tuning](api/tuning.md)):
 
 ```python
 import h5py
 
 path = UPath("s3://my-bucket/atlas.h5ad")
-with path.open("rb", access="auto") as f, h5py.File(f) as h5:
+with path.open("rb") as f, h5py.File(f) as h5:  # tuned for HDF5 access
     cell_types = h5["obs/cell_type/categories"][:]
+
+with path.open("rb", access=None) as f:  # opt out: fsspec defaults
+    ...
 ```
 
 ### How do I create a custom UPath for a new filesystem?

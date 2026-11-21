@@ -1,8 +1,8 @@
 # Access patterns and fetch tuning benchmarks
 
-Benchmarks behind `upath.tuning`: how common scientific formats (h5ad/HDF5,
-parquet, zarr) access remote files, and which fsspec fetch settings work best
-for a given network.
+Benchmarks behind `upath.tuning` (used by `UPath.open()` on cloud and HTTP
+paths): how common scientific formats (h5ad/HDF5, parquet, zarr) access remote
+files, and which fsspec fetch settings work best for a given network.
 
 All reads go through `UPath` against `SimRemoteFS` (`simfs.py`), a fake remote
 filesystem whose files subclass `fsspec.spec.AbstractBufferedFile` exactly like

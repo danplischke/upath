@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - upath.tuning: experimental access-pattern based fetch tuning, `UPath.open(..., access=...)` and a hybrid block cache for remote reads
 
+### Changed
+- upath.core: `UPath.open()` on s3, gcs, azure, hf and http paths picks fsspec cache settings from the file suffix for HDF5 (`.h5ad`, `.h5`, `.nc`, ...) and parquet files; opt out with `access=None`, `upath.tuning.set_default_access(None)` or `UPATH_FETCH_TUNING=0`
+
 ## [0.3.10] - 2026-02-22
 
 ### Fixed

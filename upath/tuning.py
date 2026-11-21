@@ -12,8 +12,18 @@ extra bytes it may over-fetch: roughly ``rtt * bandwidth``. Smaller blocks
 pay too many round trips; larger blocks download bytes nobody asked for.
 
 This module maps an access hint plus a :class:`NetworkProfile` to keyword
-arguments for ``UPath.open()`` / ``fs.open()``. Use it via
-``UPath.open(..., access=...)`` or call :func:`fetch_options` directly.
+arguments for ``UPath.open()`` / ``fs.open()``.
+
+By default, ``UPath.open()`` in a read mode detects the access pattern from
+the file suffix (``.h5ad``, ``.h5``, ``.nc``, ... -> ``"scattered"``;
+``.parquet`` -> ``"planned"``) on filesystems whose files use fsspec's
+caches (s3, gcs, azure, hf, http). Explicit ``cache_type``, ``block_size`` or
+``buffering`` arguments and cache settings in the path's storage options are
+left untouched. To opt out:
+
+- per call: ``path.open("rb", access=None)``
+- per process: ``upath.tuning.set_default_access(None)``
+- per environment: ``UPATH_FETCH_TUNING=0``
 
 The rules come from benchmarks on GB-scale h5ad and parquet files over
 simulated networks (see ``dev/access_patterns/`` in the repository).
@@ -22,6 +32,8 @@ simulated networks (see ``dev/access_patterns/`` in the repository).
 from __future__ import annotations
 
 import math
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from typing import Literal
@@ -31,6 +43,8 @@ from fsspec.caching import BlockCache
 from fsspec.caching import caches
 from fsspec.caching import register_cache
 
+from upath.types import UNSET_DEFAULT
+
 __all__ = [
     "AccessHint",
     "NetworkProfile",
@@ -38,6 +52,8 @@ __all__ = [
     "HybridBlockCache",
     "fetch_options",
     "guess_access",
+    "get_default_access",
+    "set_default_access",
 ]
 
 # How a reader accesses a file, see fetch_options() for the meaning of each hint.
@@ -46,6 +62,19 @@ AccessHint = Literal["auto", "scattered", "planned", "whole"]
 _MiB = 2**20
 _MIN_BLOCK = 1 * _MiB
 _MAX_BLOCK = 16 * _MiB
+
+# storage options with which a user configures fsspec's file caching on the
+# filesystem itself; automatic tuning never overrides them
+_FS_CACHE_OPTIONS = frozenset(
+    {
+        "cache_type",
+        "cache_options",
+        "block_size",
+        "blocksize",
+        "default_cache_type",
+        "default_block_size",
+    }
+)
 
 _SUFFIX_HINTS: dict[str, AccessHint] = {
     # HDF5 containers: metadata B-tree walks + chunk-sized reads
@@ -185,7 +214,7 @@ def fetch_options(
     >>> fetch_options("planned")
     {'cache_type': 'none'}
     """
-    if access not in get_args(AccessHint):
+    if access is None or access not in get_args(AccessHint):
         raise ValueError(
             f"access must be one of {get_args(AccessHint)!r}, got {access!r}"
         )
@@ -204,3 +233,61 @@ def fetch_options(
         "cache_type": HybridBlockCache.name,
         "block_size": _block_size(network or DEFAULT_NETWORK),
     }
+
+
+def _validate(access: AccessHint | None) -> None:
+    if access is not None and access not in get_args(AccessHint):
+        raise ValueError(
+            f"access must be one of {get_args(AccessHint)!r} or None, got {access!r}"
+        )
+
+
+def _default_access_from_env() -> AccessHint | None:
+    value = os.environ.get("UPATH_FETCH_TUNING", "").strip().lower()
+    if value in {"0", "false", "off", "no", "none"}:
+        return None
+    return "auto"
+
+
+_default_access: AccessHint | None = _default_access_from_env()
+
+
+def get_default_access() -> AccessHint | None:
+    """Return the access hint ``UPath.open()`` uses when none is passed."""
+    return _default_access
+
+
+def set_default_access(access: AccessHint | None) -> None:
+    """Set the access hint ``UPath.open()`` uses when none is passed.
+
+    ``"auto"`` (the default) detects the access pattern from the suffix;
+    ``None`` disables automatic tuning, so files are opened with the
+    filesystem's own defaults unless ``access`` is passed explicitly.
+    The initial value is ``None`` if the environment variable
+    ``UPATH_FETCH_TUNING`` is ``0``, ``false``, ``off``, ``no`` or ``none``.
+    """
+    global _default_access
+    _validate(access)
+    _default_access = access
+
+
+def _open_options(path: Any, access: Any = UNSET_DEFAULT) -> dict[str, Any]:
+    """Fetch options ``UPath.open()`` adds for ``access`` (unset: the default).
+
+    An explicit ``access`` always applies. The default only applies to path
+    classes marked with ``_supports_fetch_tuning`` (filesystems whose files
+    use fsspec's caches) and never overrides cache settings configured in the
+    path's storage options.
+    """
+    if access is UNSET_DEFAULT:
+        access = _default_access
+        if access is None or not getattr(path, "_supports_fetch_tuning", False):
+            return {}
+        storage_options = getattr(path, "storage_options", {})
+        if isinstance(storage_options, Mapping) and not _FS_CACHE_OPTIONS.isdisjoint(
+            storage_options
+        ):
+            return {}
+    if access is None:
+        return {}
+    return fetch_options(access, path=path)

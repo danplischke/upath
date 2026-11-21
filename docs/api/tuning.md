@@ -9,23 +9,57 @@ reader accesses the file and on the latency and bandwidth of the link, neither
 of which the filesystem knows. `upath.tuning` maps an access hint plus a
 network profile to `open()` keyword arguments.
 
+## Automatic detection
+
+`UPath.open()` in a read mode detects the access pattern from the file suffix
+on filesystems whose files use fsspec's caches (`s3`, `gcs`, `az`/`abfs`, `hf`,
+`http`/`https`):
+
 ```python
+import h5py
 from upath import UPath
 
-# h5py reads scattered metadata and chunks
-with UPath("s3://bucket/atlas.h5ad").open("rb", access="scattered") as f:
+# .h5ad -> "scattered": hybrid block cache sized from the network profile
+with UPath("s3://bucket/atlas.h5ad").open("rb") as f, h5py.File(f) as h5:
     ...
 
-# pyarrow plans and coalesces its own byte ranges
-with UPath("s3://bucket/table.parquet").open("rb", access="planned") as f:
-    ...
-
-# guess from the suffix (.h5ad, .h5, .nc, ... -> scattered; .parquet -> planned)
-with UPath("s3://bucket/atlas.h5ad").open("rb", access="auto") as f:
+# .parquet -> "planned": no fsspec cache, pyarrow coalesces its own reads
+with UPath("s3://bucket/table.parquet").open("rb") as f:
     ...
 ```
 
-`access="scattered"` sizes blocks from the bandwidth-delay product of
+Files with other suffixes, other filesystems, write modes and local paths keep
+their previous behavior. Detection never overrides cache settings you choose:
+
+- `cache_type`, `block_size` or `buffering` passed to `open()`, and
+- cache options in the path's storage options (`default_cache_type`,
+  `default_block_size`, `block_size`, `blocksize`, `cache_type`,
+  `cache_options`).
+
+### Opting out
+
+```python
+# per call
+path.open("rb", access=None)
+
+# per process
+import upath.tuning
+upath.tuning.set_default_access(None)
+```
+
+or set the environment variable `UPATH_FETCH_TUNING=0` (also `false`, `off`,
+`no`, `none`) before importing `upath`.
+
+## Explicit hints and network profiles
+
+Pass `access=` to apply a hint on any filesystem, or to override the suffix:
+
+```python
+with UPath("s3://bucket/data.bin").open("rb", access="scattered") as f:
+    ...
+```
+
+`"scattered"` sizes blocks from the bandwidth-delay product of
 [`DEFAULT_NETWORK`](#upath.tuning.DEFAULT_NETWORK) (same-region cloud). For
 other links, build the options yourself:
 
@@ -38,9 +72,6 @@ with UPath("s3://bucket/atlas.h5ad").open("rb", **opts) as f:
     ...
 ```
 
-Explicit `cache_type`, `block_size` or `buffering` arguments to `open()` take
-precedence over the hint. Hints are ignored for write modes and for local files.
-
 ## Access hints
 
 | hint | typical reader | fsspec options |
@@ -48,7 +79,8 @@ precedence over the hint. Hints are ignored for write modes and for local files.
 | `"scattered"` | h5py on HDF5 (h5ad, h5, netCDF4, loom) | `upath-hybrid` cache, block = 2 × RTT × bandwidth, clamped to 1–16 MiB |
 | `"planned"` | pyarrow on parquet | `cache_type="none"` |
 | `"whole"` | reading the entire file | `cache_type="all"` |
-| `"auto"` | any | one of the above from the suffix, else filesystem defaults |
+| `"auto"` (default) | any | one of the above from the suffix, else filesystem defaults |
+| `None` | any | filesystem defaults |
 
 The rules come from benchmarks of GB-scale h5ad and parquet files over simulated
 networks; see `dev/access_patterns/` in the repository for the harness and results.
@@ -56,6 +88,18 @@ networks; see `dev/access_patterns/` in the repository for the harness and resul
 ## API
 
 ::: upath.tuning.fetch_options
+    options:
+        heading_level: 3
+        show_root_heading: true
+        show_root_full_path: false
+
+::: upath.tuning.get_default_access
+    options:
+        heading_level: 3
+        show_root_heading: true
+        show_root_full_path: false
+
+::: upath.tuning.set_default_access
     options:
         heading_level: 3
         show_root_heading: true
