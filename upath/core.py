@@ -71,6 +71,8 @@ if TYPE_CHECKING:
     from pydantic import GetCoreSchemaHandler
     from pydantic_core.core_schema import CoreSchema
 
+    from upath.tuning import AccessHint
+
     _MT = TypeVar("_MT")
     _WT = TypeVar("_WT", bound="WritablePath")
 
@@ -1467,6 +1469,8 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         encoding: str = ...,
         errors: str = ...,
         newline: str = ...,
+        *,
+        access: AccessHint | None = ...,
         **fsspec_kwargs: Any,
     ) -> TextIO: ...
 
@@ -1478,6 +1482,8 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         encoding: str = ...,
         errors: str = ...,
         newline: str = ...,
+        *,
+        access: AccessHint | None = ...,
         **fsspec_kwargs: Any,
     ) -> BinaryIO: ...
 
@@ -1489,6 +1495,8 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         encoding: str | None = ...,
         errors: str | None = ...,
         newline: str | None = ...,
+        *,
+        access: AccessHint | None = ...,
         **fsspec_kwargs: Any,
     ) -> IO[Any]: ...
 
@@ -1499,6 +1507,8 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         encoding: str | None = UNSET_DEFAULT,
         errors: str | None = UNSET_DEFAULT,
         newline: str | None = UNSET_DEFAULT,
+        *,
+        access: AccessHint | None = None,
         **fsspec_kwargs: Any,
     ) -> IO[Any]:
         """
@@ -1517,6 +1527,14 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
             Error handling for encoding. Only used in text mode. Default is None.
         newline:
             Newline handling. Only used in text mode. Default is None.
+        access:
+            Experimental. How the reader will access the file, used to pick
+            fsspec's ``cache_type`` and ``block_size`` for remote reads:
+            ``"scattered"`` (e.g. HDF5/h5ad via h5py), ``"planned"`` (e.g.
+            parquet via pyarrow), ``"whole"``, or ``"auto"`` to guess from
+            the suffix. Explicitly passed ``cache_type``, ``block_size`` or
+            ``buffering`` take precedence. Ignored for write modes. See
+            :mod:`upath.tuning`. Default is None (filesystem defaults).
         **fsspec_kwargs:
             Additional options for the fsspec filesystem.
         """
@@ -1533,6 +1551,11 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
             fsspec_kwargs["errors"] = errors
         if newline is not UNSET_DEFAULT:
             fsspec_kwargs["newline"] = newline
+        if access is not None and not set(mode) & set("wax+"):
+            from upath.tuning import fetch_options
+
+            for key, value in fetch_options(access, path=self).items():
+                fsspec_kwargs.setdefault(key, value)
         return self.fs.open(self.path, mode=mode, **fsspec_kwargs)
 
     # === pathlib.Path ================================================

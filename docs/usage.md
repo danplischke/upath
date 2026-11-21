@@ -265,6 +265,21 @@ with fs.open(path_str, 'rb') as f:
     data = f.read()
 ```
 
+### How do I speed up reads of large remote files?
+
+fsspec's default cache settings fit sequential reads. Formats such as HDF5/h5ad
+or parquet read only parts of a file, and the defaults can download many times
+the bytes actually needed. Tell `open()` how the file will be read
+(experimental, see [Fetch tuning](api/tuning.md)):
+
+```python
+import h5py
+
+path = UPath("s3://my-bucket/atlas.h5ad")
+with path.open("rb", access="auto") as f, h5py.File(f) as h5:
+    cell_types = h5["obs/cell_type/categories"][:]
+```
+
 ### How do I create a custom UPath for a new filesystem?
 
 Let's say you have an fsspec filesystem with protocol `myproto` and the default

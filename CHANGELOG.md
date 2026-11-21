@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- upath.tuning: experimental access-pattern based fetch tuning, `UPath.open(..., access=...)` and a hybrid block cache for remote reads
+
 ## [0.3.10] - 2026-02-22
 
 ### Fixed
