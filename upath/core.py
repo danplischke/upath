@@ -42,7 +42,7 @@ from upath._stat import UPathStatResult
 from upath.registry import _get_implementation_protocols
 from upath.registry import available_implementations
 from upath.registry import get_upath_class
-from upath.tuning import _open_options
+from upath.tuning import _apply_open_options
 from upath.types import UNSET_DEFAULT
 from upath.types import JoinablePathLike
 from upath.types import OnNameCollisionFunc
@@ -1556,8 +1556,7 @@ class UPath(_UPathMixin, WritablePath, ReadablePath):
         if newline is not UNSET_DEFAULT:
             fsspec_kwargs["newline"] = newline
         if not set(mode) & set("wax+"):
-            for key, value in _open_options(self, access).items():
-                fsspec_kwargs.setdefault(key, value)
+            _apply_open_options(self, access, fsspec_kwargs)
         return self.fs.open(self.path, mode=mode, **fsspec_kwargs)
 
     # === pathlib.Path ================================================

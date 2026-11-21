@@ -24,6 +24,8 @@ time on a shared link of fixed aggregate capacity.
 | `bench_big.py` | GB files, real-time simulated network: shipped defaults vs alternatives, per network profile |
 | `zarr_big.py` | GB zarr arrays and AnnData-on-zarr, real-time: concurrency 10 vs formula vs 64 |
 | `analyze_big.py` | summary tables from `results/*.jsonl` |
+| `make_other.py`, `sweep_other.py`, `analyze_other.py` | ~300 MB TIFF, FITS, ORC, feather, npz, netCDF3, CSV.gz files: cost-model sweep |
+| `detect_network.py` | real-time check of `upath.tuning`'s network detection vs a pinned 4 MiB default |
 | `results/` | raw results (`*.jsonl`, `sweep_small.json`) and summaries (`summary_*.md`) |
 
 ## Running
@@ -104,11 +106,60 @@ does. Full 1 GiB read of 256 KiB chunks: cloud 11.2 s at the default of 10 vs
 slower at 6). Sharded arrays coalesce inner-chunk reads (81 chunks -> 11 GETs)
 and are insensitive to concurrency.
 
+## Other formats
+
+`sweep_other.py` traces readers that take file objects on ~300 MB files and
+prices each config with the cost model above. Speedup of what `UPath.open()`
+applies by default (4 MiB hybrid blocks, or `none` for feather) over the s3fs
+and gcsfs defaults, geometric mean over workloads, range over the four
+profiles:
+
+| format (reader) | vs s3fs default | vs gcsfs default | mapped |
+|---|---|---|---|
+| ORC (pyarrow) | 3.2-5.5x | 6.6-7.5x | `scattered` |
+| tiled TIFF / COG (tifffile) | 2.9-4.6x | 1.1x | `scattered` |
+| FITS (astropy) | 3.3-5.0x | 1.0-1.1x | `scattered` |
+| netCDF3 (scipy) | 3.3-3.5x | 1.3x | `scattered` (`.nc`) |
+| feather (pyarrow) | 1.4-3.6x | 1.0-1.8x | `planned` |
+| npz (numpy) | 1.0-1.6x | 0.9x | not mapped |
+| CSV.gz (pandas, streaming) | 0.6-1.0x | 0.9-1.0x | not mapped |
+
+Sequential streams are served best by fsspec's defaults, so unknown suffixes
+keep them.
+
+Block-size rule, priced on all traces (gap to the best tested config,
+geometric mean / worst, over workloads x four profiles):
+
+| rule | h5ad | TIFF, FITS, ORC, netCDF |
+|---|---|---|
+| fixed 4 MiB | 1.41 / 4.01 | 1.39 / 11.05 |
+| 2 x BDP, 1-16 MiB | 1.24 / 2.84 | 1.20 / 3.26 |
+| 2 x BDP, 1-4 MiB (used) | 1.28 / 2.84 | 1.15 / 3.26 |
+
+The 4 MiB cap also bounds hybrid cache memory to 32 x 4 MiB per open file.
+
+## Network detection
+
+`detect_network.py` opens a sequence of files (h5ad obs+var, two 2k-row slices,
+a parquet row group, obs+var again) through the real-time simulated network,
+once with detection and once with `DEFAULT_NETWORK` pinned (4 MiB blocks):
+
+| profile | true RTT / bandwidth | estimate after first file | blocks | 2k-row slices | obs+var again |
+|---|---|---|---|---|---|
+| LAN/HPC | 0.5 ms / 400 MB/s | 0.64-0.73 ms / 324-375 MB/s | 1 MiB | 0.07 s vs 0.17 s | 0.99 s vs 0.94 s |
+| cloud same-region | 20 ms / 100 MB/s | 20.2 ms / 93-95 MB/s | 4 MiB | same | same |
+| laptop->cloud | 40 ms / 12 MB/s | 40.3 ms / 11.9-12.0 MB/s | 1 MiB | 2.3 / 2.0 s vs 5.1 / 4.3 s | 10.4 s vs 9.3 s |
+| cross-continent | 150 ms / 25 MB/s | 150.2 ms / 24.6-24.9 MB/s | 4 MiB (cap) | same | same |
+
+The first open of an endpoint costs one or two extra round trips (latency
+probe). Results: `results/detect_*.jsonl`.
+
 ## Caveats
 
 Synthetic data (random sparse counts; parquet columns are random floats and
 barely compress). The simulated network has no latency jitter, throttling or
 TCP slow start. Benchmark processes for different profiles ran concurrently;
 they mostly sleep (load ~0.3), but CPU-heavy steps may be slightly inflated.
-Only h5ad and parquet were benchmarked; other suffixes in
-`upath.tuning._SUFFIX_HINTS` are mapped by format family.
+h5ad and parquet were benchmarked in real time; TIFF, FITS, ORC, feather and
+netCDF3 with the cost model only; `.nwb`, `.nxs` and the other HDF5 suffixes
+in `upath.tuning._SUFFIX_HINTS` are mapped by format family.
