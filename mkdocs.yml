@@ -55,6 +55,7 @@ nav:
     - Registry: api/registry.md
     - Implementations: api/implementations.md
     - Extensions: api/extensions.md
+    - Fetch tuning: api/tuning.md
     - Types: api/types.md
   - Migration Guide: migration.md
 

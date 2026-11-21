@@ -342,6 +342,8 @@ class LocalPath(_UPathMixin, pathlib.Path):
         newline: str | None = UNSET_DEFAULT,
         **fsspec_kwargs: Any,
     ) -> IO[Any]:
+        # fetch tuning (upath.tuning) only applies to remote buffered files
+        fsspec_kwargs.pop("access", None)
         if not fsspec_kwargs:
             kwargs: dict[str, str | int | None] = {}
             if buffering is not UNSET_DEFAULT:

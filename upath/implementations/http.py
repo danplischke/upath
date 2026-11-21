@@ -34,6 +34,8 @@ __all__ = ["HTTPPath"]
 
 class HTTPPath(UPath):
     __slots__ = ()
+    # files are fsspec AbstractBufferedFiles: upath.tuning applies by default
+    _supports_fetch_tuning = True
 
     if TYPE_CHECKING:
 

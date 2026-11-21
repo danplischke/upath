@@ -565,6 +565,17 @@
     reveal_type(p.open("rb"))  # N: Revealed type is "typing.BinaryIO"
     reveal_type(p.open("wb"))  # N: Revealed type is "typing.BinaryIO"
 
+- case: upath_method_open_access
+  disable_cache: false
+  main: |
+    from upath import UPath
+
+    p = UPath("")
+    reveal_type(p.open(access="auto"))  # N: Revealed type is "typing.TextIO"
+    reveal_type(p.open("rb", access="scattered"))  # N: Revealed type is "typing.BinaryIO"
+    reveal_type(p.open("rb", access="planned", block_size=2**20))  # N: Revealed type is "typing.BinaryIO"
+    reveal_type(p.open("rb", access=None))  # N: Revealed type is "typing.BinaryIO"
+
 - case: upath_method_open_fsspec_kwargs
   disable_cache: false
   parametrized:

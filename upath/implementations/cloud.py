@@ -45,6 +45,8 @@ __all__ = [
 
 class CloudPath(UPath):
     __slots__ = ()
+    # files are fsspec AbstractBufferedFiles: upath.tuning applies by default
+    _supports_fetch_tuning = True
 
     @classmethod
     def _transform_init_args(
